@@ -12,10 +12,13 @@ use futures::StreamExt;
 use nix::sys::signal::Signal;
 #[cfg(not(target_os = "windows"))]
 use nix::unistd::Pid;
+use regex::Regex;
 use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,12 +27,12 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tauri::State;
 use tauri::{Manager, Window};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::process::Command as AsyncCommand;
 use tokio::task;
 use tokio::time::Duration;
 use toml::Value as TomlValue;
-
 /* ---------------------------------------------------- MUTEX APP STATE ------------------------------------------------------------ */
 
 struct AppState {
@@ -47,8 +50,53 @@ impl AppState {
 }
 
 /* ---------------------------------------------------- INSTALL COMMAND ------------------------------------------------------------ */
+
+fn find_concordium_node_executable() -> Result<PathBuf, Box<dyn Error>> {
+    #[cfg(target_os = "windows")]
+    let paths = vec![(
+        Path::new(r"C:\Program Files\Concordium"),
+        Some(Regex::new(r"Node \d+\.\d+\.\d+")?),
+    )];
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let paths = vec![
+        (Path::new("/usr/bin/concordium-node"), None::<Regex>),
+        (Path::new("/usr/local/bin/concordium-node"), None),
+    ];
+
+    for (base_path, pattern_opt) in paths {
+        if let Some(pattern) = pattern_opt {
+            if base_path.exists() && base_path.is_dir() {
+                for entry in fs::read_dir(base_path)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                            if pattern.is_match(dir_name) {
+                                let executable_path = path.join("concordium-node.exe");
+                                if executable_path.exists() {
+                                    return Ok(executable_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if base_path.exists() {
+            return Ok(base_path.to_path_buf());
+        }
+    }
+
+    Err("Concordium Node executable not found".into())
+}
+
 #[tauri::command]
-async fn install() -> Result<(), String> {
+async fn install(handle: tauri::AppHandle) -> Result<(), String> {
+    if find_concordium_node_executable().is_ok() {
+        // Concordium Node is already installed, skip installation
+        return Ok(());
+    }
+
     // Detect the user's OS and architecture and generate the correct link for it.
     let download_url = if cfg!(target_os = "windows") {
         "https://distribution.concordium.software/windows/Signed/Node-6.0.4-0.msi"
@@ -85,14 +133,15 @@ async fn install() -> Result<(), String> {
     match download_file(&download_url, &destination_str).await {
         Ok(_) => {
             if cfg!(target_os = "linux") {
-                let script_path =
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("install_concordium_debian.sh");
-                let script_str = script_path
-                    .to_str()
-                    .ok_or("Failed to convert script path to string")?;
+                let script_str = handle
+                    .path_resolver()
+                    .resolve_resource("assets/install_concordium_debian.sh")
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
 
                 let status = Command::new("pkexec")
-                    .args(&["bash", script_str, destination_str])
+                    .args(&["bash", &script_str, destination_str])
                     .status()
                     .map_err(|_| "Failed to execute the bash script with pkexec")?;
 
@@ -135,15 +184,11 @@ async fn install() -> Result<(), String> {
 
 #[tauri::command]
 async fn verify_installation() -> Result<String, String> {
-    let binary = if cfg!(target_os = "windows") {
-        r"C:\Program Files\Concordium\Node 6.0.4\concordium-node.exe"
-    } else if cfg!(target_os = "linux") {
-        "/usr/bin/concordium-node"
-    } else {
-        "/usr/local/bin/concordium-node"
-    };
+    let binary = find_concordium_node_executable().map_err(|e| e.to_string())?;
 
-    let output = std::process::Command::new(binary).arg("--version").output();
+    let output = std::process::Command::new(&binary)
+        .arg("--version")
+        .output();
 
     match output {
         Ok(output) => {
@@ -400,14 +445,9 @@ async fn launch_template(
     };
 
     if should_run_concordium_node {
-        let binary = if cfg!(target_os = "windows") {
-            r"C:\Program Files\Concordium\Node 6.0.4\concordium-node.exe"
-        } else if cfg!(target_os = "linux") {
-            "concordium-node"
-        } else {
-            "/usr/local/bin/concordium-node"
-        };
-        let child = AsyncCommand::new(binary)
+        let binary = find_concordium_node_executable().map_err(|e| e.to_string())?;
+
+        let mut child = AsyncCommand::new(binary)
             .args(&[
                 "--no-bootstrap=true",
                 "--listen-port",
@@ -429,23 +469,34 @@ async fn launch_template(
             .spawn()
             .expect("Failed to start the node.");
 
+        let reader = BufReader::new(child.stderr.take().expect("Failed to capture stdout."));
         let mut state = app_state.lock().unwrap();
         state.child_process = Some(child);
 
         let window_clone: Option<Window> = state.main_window.clone();
-
+        let mut lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>> = reader.lines();
         // Block Indexer
         tokio::spawn(async move {
-            loop {
+            while let Some(line) = lines.next_line().await.expect("Failed to read line.") {
+                // logging
                 if let Some(window) = &window_clone {
+                    println!("{:#?}", line);
+                    //logging
                     if let Some(block_info) = parse_block_info().await {
-                        // Check if the block is not the same as the last one
-                        window.emit("new-block", block_info.clone()).unwrap();
+                        window.emit("new-block", block_info).unwrap();
                     }
                 }
-
-                tokio::time::sleep(Duration::from_millis(100)).await; // Optional: avoid busy waiting by adding a small sleep
             }
+            // loop {
+            //     if let Some(window) = &window_clone {
+            //         if let Some(block_info) = parse_block_info().await {
+            //             // Check if the block is not the same as the last one
+            //             window.emit("new-block", block_info.clone()).unwrap();
+            //         }
+            //     }
+
+            //     tokio::time::sleep(Duration::from_millis(100)).await; // Optional: avoid busy waiting by adding a small sleep
+            // }
         });
         let window_clone: Option<Window> = state.main_window.clone();
 
@@ -537,14 +588,9 @@ async fn launch_template(
         // Finally call Concordium Node to Run the Local Chain but run it as an async command for the frontend to aknowledge
         // That it is actually running successfully.
 
-        let binary = if cfg!(target_os = "windows") {
-            r"C:\Program Files\Concordium\Node 6.0.4\concordium-node.exe"
-        } else if cfg!(target_os = "linux") {
-            "concordium-node"
-        } else {
-            "/usr/local/bin/concordium-node"
-        };
-        let child = AsyncCommand::new(binary)
+        let binary = find_concordium_node_executable().map_err(|e| e.to_string())?;
+
+        let mut child = AsyncCommand::new(binary)
             .args(&[
                 "--no-bootstrap=true",
                 "--listen-port",
@@ -566,23 +612,36 @@ async fn launch_template(
             .spawn()
             .expect("Failed to start the node.");
 
+        let reader = BufReader::new(child.stderr.take().expect("Failed to capture stdout."));
         let mut state = app_state.lock().unwrap();
         state.child_process = Some(child);
 
-        let window_clone = state.main_window.clone();
-
-        // BLOCK INDEXER
+        let window_clone: Option<Window> = state.main_window.clone();
+        let mut lines: tokio::io::Lines<BufReader<tokio::process::ChildStderr>> = reader.lines();
+        // Block Indexer
         tokio::spawn(async move {
-            loop {
+            while let Some(line) = lines.next_line().await.expect("Failed to read line.") {
+                // logging
                 if let Some(window) = &window_clone {
+                    println!("{:#?}", line);
+                    //logging
                     if let Some(block_info) = parse_block_info().await {
-                        // Check if the block is not the same as the last one
-                        window.emit("new-block", block_info.clone()).unwrap();
+                        window.emit("new-block", block_info).unwrap();
                     }
                 }
-
-                tokio::time::sleep(Duration::from_millis(100)).await; // Optional: avoid busy waiting by adding a small sleep
             }
+            // BLOCK INDEXER
+            // tokio::spawn(async move {
+            //     loop {
+            //         if let Some(window) = &window_clone {
+            //             if let Some(block_info) = parse_block_info().await {
+            //                 // Check if the block is not the same as the last one
+            //                 window.emit("new-block", block_info.clone()).unwrap();
+            //             }
+            //         }
+
+            //         tokio::time::sleep(Duration::from_millis(100)).await; // Optional: avoid busy waiting by adding a small sleep
+            //     }
         });
         let window_clone: Option<Window> = state.main_window.clone();
 
